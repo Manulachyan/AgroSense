@@ -148,8 +148,20 @@ if "live_temp" not in st.session_state:
     st.session_state.live_temp = 25.0
 if "last_data_time" not in st.session_state:
     st.session_state.last_data_time = 0
+if "last_raw_line" not in st.session_state:
+    st.session_state.last_raw_line = ""
+if "last_yield" not in st.session_state:
+    st.session_state.last_yield = 0
+if "last_fert" not in st.session_state:
+    st.session_state.last_fert = ""
+if "last_desc" not in st.session_state:
+    st.session_state.last_desc = ""
 if "serial_connected" not in st.session_state:
     st.session_state.serial_connected = False
+if "file_monitoring" not in st.session_state:
+    st.session_state.file_monitoring = False
+if "file_thread_active" not in st.session_state:
+    st.session_state.file_thread_active = False
 if "port" not in st.session_state:
     st.session_state.port = None
 
@@ -168,14 +180,38 @@ def serial_reader():
             break
         time.sleep(0.1)
 
+def get_latest_from_file(filepath):
+    try:
+        if os.path.exists(filepath):
+            with open(filepath, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 8192), 0)
+                chunk = f.read().decode('utf-8', errors='ignore')
+                lines = chunk.strip().split('\n')
+                for line in reversed(lines):
+                    line = line.strip()
+                    if '{' in line and '"temp"' in line:
+                        start = line.find('{')
+                        end = line.rfind('}') + 1
+                        if start != -1 and end > start:
+                            data = json.loads(line[start:end])
+                            st.session_state.last_raw_line = line[start:end]
+                            return data.get("moisture", 0), data.get("temp", 25.0)
+    except Exception:
+        pass
+    return None, None
+
 def connect_hardware(port_name):
     try:
         st.session_state.port = serial.Serial(port_name, 115200, timeout=1)
         st.session_state.serial_connected = True
+        st.session_state.file_monitoring = False
         thread = threading.Thread(target=serial_reader, daemon=True)
         thread.start()
         return True
-    except:
+    except Exception as e:
+        st.error(f"Hardware Error: {str(e)}")
         return False
 
 # --- LOGIC ---
@@ -241,64 +277,96 @@ def show_predictor():
         k = st.slider("Potassium (K)", 0, 140, 40)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Hardware Connection Section
-    with st.expander("🔌 Hardware Integration", expanded=True):
-        cols = st.columns([2, 1])
-        with cols[0]:
-            available_ports = [p.device for p in serial.tools.list_ports.comports()]
-            selected_port = st.selectbox("Select ESP32 Port", available_ports if available_ports else ["No ports found"])
-        with cols[1]:
-            if not st.session_state.serial_connected:
-                if st.button("CONNECT"):
-                    if connect_hardware(selected_port):
-                        st.success(f"Connected to {selected_port}")
+    # Data Source Connection Section
+    with st.expander("🔌 Data Source Integration", expanded=True):
+        source_type = st.radio("Connect via:", ["Serial Port (Live)", "Log File (LIFO)"], horizontal=True)
+        
+        if source_type == "Serial Port (Live)":
+            cols = st.columns([2, 1])
+            with cols[0]:
+                available_ports = [p.device for p in serial.tools.list_ports.comports()]
+                selected_port = st.selectbox("Select ESP32 Port", available_ports if available_ports else ["No ports found"])
+            with cols[1]:
+                if not st.session_state.serial_connected:
+                    if st.button("CONNECT SERIAL"):
+                        if connect_hardware(selected_port):
+                            st.success(f"Connected to {selected_port}")
+                            st.rerun()
+                else:
+                    if st.button("DISCONNECT SERIAL"):
+                        st.session_state.serial_connected = False
+                        if st.session_state.port: st.session_state.port.close()
                         st.rerun()
-                    else:
-                        st.error("Failed to connect.")
-            else:
-                if st.button("DISCONNECT"):
-                    st.session_state.serial_connected = False
-                    if st.session_state.port: st.session_state.port.close()
-                    st.rerun()
-
-    if st.session_state.serial_connected:
-        if st.session_state.last_data_time < time.time() - 2:
-            st.warning("⚠️ Waiting for data... (Check ESP32 Port & Wiring)")
         else:
-            st.success("✅ Real-time Stream Active")
+            cols = st.columns([2, 1])
+            with cols[0]:
+                log_file = st.text_input("Log File Path", "Output data.txt")
+            with cols[1]:
+                if not st.session_state.file_monitoring:
+                    if st.button("MONITOR FILE"):
+                        st.session_state.file_monitoring = True
+                        st.session_state.serial_connected = False
+                        st.rerun()
+                else:
+                    if st.button("STOP MONITOR"):
+                        st.session_state.file_monitoring = False
+                        st.rerun()
+
+    # --- MAIN THREAD DATA INGESTION ---
+    if st.session_state.file_monitoring:
+        m, t = get_latest_from_file(log_file)
+        if m is not None:
+            st.session_state.live_moisture = m
+            st.session_state.live_temp = t
+            st.session_state.last_data_time = time.time()
+
+    if st.session_state.serial_connected or st.session_state.file_monitoring:
+        if st.session_state.last_data_time < time.time() - 3:
+            st.warning("⚠️ Waiting for data updates...")
+        else:
+            mode_label = "Serial" if st.session_state.serial_connected else "File (LIFO)"
+            st.success(f"✅ Active Stream: {mode_label}")
             
         mc1, mc2 = st.columns(2)
-        mc1.metric("Live Soil Moisture", f"{st.session_state.live_moisture}%")
-        mc2.metric("Live Temperature", f"{st.session_state.live_temp:.1f}°C")
+        last_upd = time.strftime("%H:%M:%S", time.localtime(st.session_state.last_data_time))
+        mc1.metric("Live Soil Moisture", f"{st.session_state.live_moisture}%", delta=f"Latest {last_upd}")
+        mc2.metric("Live Temperature", f"{st.session_state.live_temp:.1f}°C", delta="Live Sync")
+        
+        with st.expander("📜 Raw Log Insight (Last Read)"):
+            st.code(st.session_state.get("last_raw_line", "No data yet"))
+            
         live_mode = st.toggle("Use Live Sensor Data for Prediction", value=True)
     else:
         live_mode = False
 
-    if st.button("RUN AI PREDICTION"):
-        with st.spinner("Analyzing..."):
-            # Prepare sensor data
-            s_temp = st.session_state.live_temp if live_mode else temp
-            s_moist = st.session_state.live_moisture if live_mode else None
-            
-            sensor = {
-                "Temperature": s_temp, 
-                "Nitrogen": n, 
-                "Phosphorous": p, 
-                "Potassium": k, 
-                "Crop Type": crop,
-                "Moisture": s_moist
-            }
-            
-            yld = predict_yield_val(sensor)
-            fert, desc = recommend_fertilizer(sensor)
+    # --- AUTO AI PREDICTION ---
+    if live_mode:
+        sensor_data = {
+            "Temperature": st.session_state.live_temp, 
+            "Nitrogen": n, "Phosphorous": p, "Potassium": k, "Crop Type": crop,
+            "Moisture": st.session_state.live_moisture
+        }
+        st.session_state.last_yield = predict_yield_val(sensor_data)
+        st.session_state.last_fert, st.session_state.last_desc = recommend_fertilizer(sensor_data)
+
+    if st.button("RUN AI PREDICTION") or live_mode:
+        with st.spinner("Analyzing...") if not live_mode else st.empty():
+            yld = st.session_state.get("last_yield", 0)
+            fert = st.session_state.get("last_fert", "Calculating...")
+            desc = st.session_state.get("last_desc", "")
             
             sc1, sc2 = st.columns(2)
             with sc1:
                 st.markdown(f'<div class="prediction-card"><p class="metric-label">Predicted Yield</p><p class="metric-value">{yld/10000:.2f} t/ha</p></div>', unsafe_allow_html=True)
                 if live_mode:
-                    st.caption(f"Hardware Mode: Using {s_temp:.1f}°C and {st.session_state.live_moisture}% moisture.")
+                    st.caption(f"🤖 AI Live Update: Using {st.session_state.live_temp:.1f}°C and {st.session_state.live_moisture}% moisture.")
             with sc2:
                 st.markdown(f'<div class="prediction-card"><p class="metric-label">Target Fertilizer</p><p class="metric-value" style="font-size:2rem">{fert}</p><p>{desc}</p></div>', unsafe_allow_html=True)
+
+    # --- AUTO REFRESH LOOP ---
+    if st.session_state.serial_connected or st.session_state.file_monitoring:
+        time.sleep(1) # Faster refresh (1 second)
+        st.rerun()
 
 def show_analytics():
     st.header("Global Agricultural Insights")
