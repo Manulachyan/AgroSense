@@ -160,7 +160,9 @@ if "serial_connected" not in st.session_state:
     st.session_state.serial_connected = False
 if "file_monitoring" not in st.session_state:
     st.session_state.file_monitoring = False
-if "file_thread_active" not in st.session_state:
+if "log_file_path" not in st.session_state:
+    st.session_state.log_file_path = "Output data.txt"
+if "port" not in st.session_state:
     st.session_state.file_thread_active = False
 if "port" not in st.session_state:
     st.session_state.port = None
@@ -307,7 +309,7 @@ def show_predictor():
         else:
             cols = st.columns([2, 1])
             with cols[0]:
-                log_file = st.text_input("Log File Path", "Output data.txt")
+                st.session_state.log_file_path = st.text_input("Log File Path", st.session_state.log_file_path)
             with cols[1]:
                 if not st.session_state.file_monitoring:
                     if st.button("MONITOR FILE"):
@@ -321,7 +323,7 @@ def show_predictor():
 
     # --- MAIN THREAD DATA INGESTION ---
     if st.session_state.file_monitoring:
-        m, t = get_latest_from_file(log_file)
+        m, t = get_latest_from_file(st.session_state.log_file_path)
         if m is not None:
             st.session_state.live_moisture = m
             st.session_state.live_temp = t
@@ -339,9 +341,6 @@ def show_predictor():
         mc1.metric("Live Soil Moisture", f"{st.session_state.live_moisture}%", delta=f"Latest {last_upd}")
         mc2.metric("Live Temperature", f"{st.session_state.live_temp:.1f}°C", delta="Live Sync")
         
-        with st.expander("📜 Raw Log Insight (Last Read)"):
-            st.code(st.session_state.get("last_raw_line", "No data yet"))
-            
         live_mode = st.toggle("Use Live Sensor Data for Prediction", value=True)
     else:
         live_mode = False
@@ -356,25 +355,43 @@ def show_predictor():
         st.session_state.last_yield = predict_yield_val(sensor_data)
         st.session_state.last_fert, st.session_state.last_desc = recommend_fertilizer(sensor_data)
 
-    if st.button("RUN AI PREDICTION") or live_mode:
-        with st.spinner("Analyzing...") if not live_mode else st.empty():
-            yld = st.session_state.get("last_yield", 0)
-            fert = st.session_state.get("last_fert", "Calculating...")
-            desc = st.session_state.get("last_desc", "")
-            
-            sc1, sc2 = st.columns(2)
-            with sc1:
-                st.markdown(f'<div class="prediction-card"><p class="metric-label">Predicted Yield</p><p class="metric-value">{yld/10000:.2f} t/ha</p></div>', unsafe_allow_html=True)
-                
-                # Confidence Indicator
-                conf = calculate_confidence(live_mode, crop)
-                st.write(f"**AI Confidence: {conf:.1f}%**")
-                st.progress(conf/100)
-                
-                if live_mode:
-                    st.caption(f"🤖 AI Live Update: Using {st.session_state.live_temp:.1f}°C and {st.session_state.live_moisture}% moisture.")
-            with sc2:
-                st.markdown(f'<div class="prediction-card"><p class="metric-label">Target Fertilizer</p><p class="metric-value" style="font-size:2rem">{fert}</p><p>{desc}</p></div>', unsafe_allow_html=True)
+    # --- UNIFIED RESULTS DISPLAY ---
+    if live_mode or st.session_state.get("last_yield", 0) > 0:
+        yld = st.session_state.get("last_yield", 0)
+        fert = st.session_state.get("last_fert", "Calculating...")
+        desc = st.session_state.get("last_desc", "")
+        conf = calculate_confidence(live_mode, crop)
+        
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            st.markdown(f'''
+                <div class="prediction-card">
+                    <p class="metric-label">Predicted Yield</p>
+                    <p class="metric-value">{yld/10000:.2f} t/ha</p>
+                    <hr style="border: 0.1px solid #334155; margin: 10px 0;">
+                    <p class="metric-label">AI Confidence Level</p>
+                    <p style="color: #60a5fa; font-weight: bold; font-size: 1.2rem;">{conf:.1f}% Certainty</p>
+                </div>
+            ''', unsafe_allow_html=True)
+            if live_mode: st.caption("🤖 AI Live Update Active")
+        
+        with sc2:
+            st.markdown(f'''
+                <div class="prediction-card">
+                    <p class="metric-label">Target Fertilizer</p>
+                    <p class="metric-value" style="font-size:2rem; color:#10b981">{fert}</p>
+                    <p>{desc}</p>
+                </div>
+            ''', unsafe_allow_html=True)
+
+    # --- MANUAL TRIGGER (ONLY IF LIVE IS OFF) ---
+    if not live_mode:
+        if st.button("RUN AI PREDICTION"):
+            with st.spinner("Analyzing..."):
+                sensor_data = {"Temperature": temp, "Nitrogen": n, "Phosphorous": p, "Potassium": k, "Crop Type": crop, "Moisture": None}
+                st.session_state.last_yield = predict_yield_val(sensor_data)
+                st.session_state.last_fert, st.session_state.last_desc = recommend_fertilizer(sensor_data)
+                st.rerun()
 
     # --- AUTO REFRESH LOOP ---
     if st.session_state.serial_connected or st.session_state.file_monitoring:
@@ -415,7 +432,6 @@ with st.sidebar:
     nav = st.radio("Navigation Menu", ["Home", "Predictor", "Analytics"], index=["Home", "Predictor", "Analytics"].index(st.session_state.current_page))
     st.session_state.current_page = nav
     st.divider()
-    st.success("System: Optimal")
 
 if st.session_state.current_page == "Home": show_home()
 elif st.session_state.current_page == "Predictor": show_predictor()
